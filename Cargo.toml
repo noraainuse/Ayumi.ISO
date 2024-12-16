@@ -8,3 +8,4 @@ eframe = "0.29.1"
 egui = "0.29.1"
 rfd = "0.15.1"
 sysinfo = "0.29.0"
+winapi = { version = "0.3", features = ["fileapi"] }
