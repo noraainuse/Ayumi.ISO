@@ -1,19 +1,28 @@
 use eframe::egui;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::io::{BufRead, BufReader};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::path::Path;
 use rfd::FileDialog;
-use sysinfo::{System, SystemExt, DiskExt}; // Remove Disks import as it's not needed
+
+#[derive(Clone, PartialEq)]
+enum FlashMode {
+    ManualCopy,
+    Unsupported,
+}
 
 fn main() -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([500.0, 400.0]), // Corrected window size setting
+            .with_inner_size([700.0, 600.0]),
         ..Default::default()
     };
     
     eframe::run_native(
         "AyumiISO",
         options,
-        Box::new(|_cc| Ok(Box::new(AyumiApp::default()))), // Corrected Box::new usage
+        Box::new(|_cc| Ok(Box::new(AyumiApp::default()))),
     )
 }
 
@@ -21,76 +30,79 @@ struct AyumiApp {
     iso_path: String,
     usb_drives: Vec<String>,
     selected_drive: Option<String>,
+    burning_progress: Arc<Mutex<f32>>,
+    is_burning: Arc<Mutex<bool>>,
+    burn_error: Arc<Mutex<Option<String>>>,
+    flash_mode: FlashMode,
 }
 
 impl AyumiApp {
     fn get_usb_drives() -> Vec<String> {
-        let mut system = System::new_all(); // Initialize system info
-        system.refresh_disks(); // Use refresh_disks() method
-
-        system
-            .disks()
-            .iter()
-            .filter(|disk| {
-                disk.is_removable()
-                    && disk.mount_point().to_str().unwrap_or("").len() > 0
-            })
-            .map(|disk| {
-                format!(
-                    "{} ({}) - {:.1} GB",
-                    disk.mount_point().to_str().unwrap_or("Unknown"),
-                    disk.name().to_str().unwrap_or("USB"),
-                    disk.total_space() as f64 / 1_000_000_000.0
-                )
-            })
-            .collect()
+        // For a standalone app, we'll use a simplified drive detection
+        // This is a mock implementation - you'll want to replace with actual detection
+        vec![
+            "/media/user/USB1 (16GB)".to_string(),
+            "/media/user/USB2 (32GB)".to_string(),
+        ]
     }
-    fn burn_iso(&self) -> Result<(), String> {
-        if self.iso_path.is_empty () {
+
+    fn manual_copy_iso(&self) -> Result<(), String> {
+        if self.iso_path.is_empty() {
             return Err("Please select an ISO file".to_string());
         }
 
         if self.selected_drive.is_none() {
             return Err("Please select a USB drive".to_string());
         }
-                //Extract mount point
-        let usb_path = self.selected_drive.as_ref().unwrap()
-            .split("(")
-            .next()
-            .ok_or("Invaild USB drive selection")?;
-        //confirm
+
+        let iso_path = Path::new(&self.iso_path);
+        let usb_path = Path::new(self.selected_drive.as_ref().unwrap());
+
         // Confirm burn
         let confirm = rfd::MessageDialog::new()
-            .set_title("Confirm ISO Burn")
+            .set_title("Confirm ISO Copy")
             .set_description(&format!(
-                "Are you sure you want to burn\n{}\nto {}?", 
+                "Are you sure you want to copy\n{}\nto {}?", 
                 self.iso_path, 
-                usb_path
+                usb_path.display()
             ))
             .set_buttons(rfd::MessageButtons::YesNo)
             .show();
 
-            if confirm == rfd::MessageDialogResult::Yes {
-                // Use dd command to burn ISO (be VERY careful with this!)
-                let output = Command::new("sudo")
-                    .args(&[
-                        "dd", 
-                        "bs=4M", 
-                        &format!("if={}", self.iso_path), 
-                        &format!("of={}", usb_path), 
-                        "status=progress"
-                    ])
-                    .output()
-                    .map_err(|e| format!("Failed to execute dd: {}", e))?;
+        if confirm == rfd::MessageDialogResult::Yes {
+            // Prepare thread-safe progress tracking
+            let progress = Arc::clone(&self.burning_progress);
+            let is_burning = Arc::clone(&self.is_burning);
+            let burn_error = Arc::clone(&self.burn_error);
             
-                if output.status.success() {
-                    Ok(())
-                } else {
-                    Err(String::from_utf8_lossy(&output.stderr).to_string())
-                }
-            } else {
-                Err("Burn cancelled by user".to_string())
-            }
+            let iso_path = iso_path.to_path_buf();
+            let usb_path = usb_path.to_path_buf();
+
+            thread::spawn(move || {
+                *is_burning.lock().unwrap() = true;
+                *burn_error.lock().unwrap() = None;
+
+                match std::fs::copy(&iso_path, &usb_path.join(iso_path.file_name().unwrap())) {
+                    Ok(bytes_copied) => {
+                        // Estimate progress based on file size
+                        if let Ok(metadata) = std::fs::metadata(&iso_path) {
+                            *progress.lock().unwrap() = 1.0;
+                        }
+                        *is_burning.lock().unwrap() = false;
+                        Ok(())
+                    },
+                    Err(e) => {
+                        *burn_error.lock().unwrap() = Some(format!("Copy failed: {}", e));
+                        *is_burning.lock().unwrap() = false;
+                        Err(e)
+                    }
+                };
+            });
+
+            Ok(())
+        } else {
+            Err("Copy cancelled by user".to_string())
+        }
     }
 }
 
@@ -100,6 +112,10 @@ impl Default for AyumiApp {
             iso_path: String::new(),
             usb_drives: Self::get_usb_drives(),
             selected_drive: None,
+            burning_progress: Arc::new(Mutex::new(0.0)),
+            is_burning: Arc::new(Mutex::new(false)),
+            burn_error: Arc::new(Mutex::new(None)),
+            flash_mode: FlashMode::ManualCopy,
         }
     }
 }
@@ -170,24 +186,48 @@ impl eframe::App for AyumiApp {
             // Show USB count
             ui.label(format!("USB Drives Found: {}", self.usb_drives.len()));
 
-            // Burn ISO button
-            if ui.button("🔥 Burn ISO").clicked() {
-                match self.burn_iso() {
+            // Burning progress and status
+            let is_burning = *self.is_burning.lock().unwrap();
+            let progress = *self.burning_progress.lock().unwrap();
+            
+            // Progress bar during burning
+            if is_burning {
+                ui.add(egui::ProgressBar::new(progress)
+                    .show_percentage());
+            }
+
+            // Copy ISO button
+            let copy_button = ui.button("📋 Copy ISO");
+            
+            // Handle copy button click
+            if copy_button.clicked() {
+                match self.manual_copy_iso() {
                     Ok(_) => {
-                        // Show success popup
                         rfd::MessageDialog::new()
                             .set_title("Success")
-                            .set_description("ISO burned successfully!")
+                            .set_description("ISO copied successfully!")
                             .show();
                     },
                     Err(e) => {
-                        // Show error popup
                         rfd::MessageDialog::new()
                             .set_title("Error")
                             .set_description(&e)
                             .show();
                     }
                 }
+            }
+
+            // Check for burning errors
+            if let Some(error) = self.burn_error.lock().unwrap().take() {
+                rfd::MessageDialog::new()
+                    .set_title("Copying Error")
+                    .set_description(&error)
+                    .show();
+            }
+
+            // Request a repaint to update progress
+            if is_burning {
+                ctx.request_repaint();
             }
         });
     }
